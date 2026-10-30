@@ -3,6 +3,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+ACTIONS = frozenset({"read", "comment", "upload_version", "delete", "share_external"})
+
+ROLE_ACTIONS = {
+    "partner": ACTIONS,
+    "associate": frozenset({"read", "comment", "upload_version"}),
+    "paralegal": frozenset({"read", "upload_version"}),
+    "client": frozenset({"read", "comment"}),
+    "auditor": frozenset(),
+}
+
 
 @dataclass(frozen=True)
 class User:
@@ -27,12 +37,51 @@ class Decision:
     allowed: bool
     reason: str
 
+def _deny(reason: str) -> Decision:
+    return Decision(False, reason)
+
+
+def _decide(user, action, doc) -> Decision:
+    # 1. unauthenticated
+    if user is None or not user.id:
+        return _deny("unauthenticated")
+    # 2. unknown_action
+    if not isinstance(action, str) or action not in ACTIONS:
+        return _deny("unknown_action")
+    # 3. unknown_role
+    if not isinstance(user.role, str) or user.role not in ROLE_ACTIONS:
+        return _deny("unknown_role")
+    # 4. legal_hold
+    if action == "delete" and doc.legal_hold:
+        return _deny("legal_hold")
+    # 5. role_not_permitted
+    if action not in ROLE_ACTIONS[user.role]:
+        return _deny("role_not_permitted")
+    # 6. tenant_mismatch: exact comparison, no normalising
+    if user.role == "client" and (user.client_id is None or user.client_id != doc.client_id):
+        return _deny("tenant_mismatch")
+    # 7. not_assigned
+    if user.role in ("associate", "paralegal") and doc.matter_id not in user.matters:
+        return _deny("not_assigned")
+    # 8. restricted
+    not_normal = doc.confidentiality != "normal"
+    if user.role in ("client", "paralegal") and not_normal:
+        return _deny("restricted")
+    # 9. mfa_required
+    if (not_normal or action == "share_external") and user.mfa is not True:
+        return _deny("mfa_required")
+    return Decision(True, "ok")
+
 
 def authorize(user: User | None, action: str, doc: Document) -> Decision:
     """Evaluate the nine rules in order and return the first denial, else Decision(True, "ok")."""
-    raise NotImplementedError
+    try:
+        return _decide(user, action, doc)
+    except Exception:
+        #if anything goes wrong while deciding, the answer is deny
+        return _deny("error")
 
 
 def visible_documents(user: User | None, docs: list[Document]) -> list[Document]:
     """The documents `user` may read, in their original order."""
-    raise NotImplementedError
+    return [d for d in docs if authorize(user, "read", d).allowed]
